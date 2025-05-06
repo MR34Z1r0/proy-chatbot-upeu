@@ -1,44 +1,76 @@
+import os
+import logging
 import boto3
 import hashlib
 import requests
-import logging
-import os
 import unicodedata
 from uuid import uuid4
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings.bedrock import BedrockEmbeddings
-from langchain_pinecone import PineconeVectorStore
-from langchain_core.documents import Document
+from dotenv import load_dotenv
+
+# Procesamiento de documentos
 from pptx import Presentation as PptxPresentation
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
-from dotenv import load_dotenv
-from langchain.text_splitter import TokenTextSplitter
 
+# Langchain y Pinecone
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter, TokenTextSplitter
+from langchain.embeddings.bedrock import BedrockEmbeddings
+from langchain_core.documents import Document
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
+
+# Utilidades personalizadas
+from artifacts.dynamodb_utils import DYNAMODB_RESOURCES, DYNAMODB_LIBRARY
+from artifacts.pinecone_utils import delete_vectors_by_file_hash
+
+# Cargar variables de entorno
 load_dotenv()
 
 # Configuración de logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# Configuración inicial
+# -------------------------------
+# Configuración de AWS y recursos
+# -------------------------------
+
+# Establecer perfil de sesión para boto3
 boto3.setup_default_session(profile_name='prd-sofia-admin')
+
+# Clientes de AWS
 s3 = boto3.client('s3')
 
-EMBEDDINGS_MODEL_ID = os.getenv("EMBEDDINGS_MODEL_ID")
+# Claves de AWS desde .env
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+# Inicializar recursos de DynamoDB
+dynamodb_resources = DYNAMODB_RESOURCES(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+dynamodb_library = DYNAMODB_LIBRARY(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+
+# -------------------------------
+# Configuración de Pinecone
+# -------------------------------
+logging.info("Inicializando conexión con Pinecone.")
+
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+EMBEDDINGS_MODEL_ID = os.getenv("EMBEDDINGS_MODEL_ID")
 DIMENSION = 1024
 
-logging.info("Inicializando conexión con Pinecone.")
-from pinecone import Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
 
-# Parámetros
+# -------------------------------
+# Parámetros generales del sistema
+# -------------------------------
 bucket_name = 'datalake-cls-509399624591-landing-s3-bucket'
 files_table_name = 'db_learning_resources'
 hash_table_name = 'db_learning_resources_hash'
+
+# Carpeta local para descargas
 download_folder = "./downloads"
 os.makedirs(download_folder, exist_ok=True)
 
@@ -77,57 +109,16 @@ def upload_to_s3(file_path, bucket, object_name):
     logging.info(f"Archivo {full_object_name} subido exitosamente.")
     return f"s3://{bucket}/{full_object_name}"
 
-def delete_resource(event):
-    resource_id = event['RecursoDidacticoId']
-    dynamodb = boto3.resource('dynamodb', region_name="us-east-1")
-    files_table = dynamodb.Table(files_table_name)
-    hash_table = dynamodb.Table(hash_table_name)
+def delete_from_s3(bucket, object_name):
+    """Elimina un archivo de un bucket de S3."""
+    full_object_name = f"SOFIA_FILE/PLANIFICACION/AV_Recursos/{object_name}"
+    logging.info(f"Eliminando archivo de S3 bucket {bucket} en la ruta {full_object_name}.")
+    s3.delete_object(Bucket=bucket, Key=full_object_name)
+    logging.info(f"Archivo {full_object_name} eliminado exitosamente.")
+    return f"Archivo s3://{bucket}/{full_object_name} eliminado."
 
-    try:
-        # Obtener el elemento de la tabla de archivos
-        response = files_table.get_item(Key={'resource_id': resource_id})
-        item = response.get('Item')
-        
-        
-        if not item:
-            message = f"El recurso con resource_id '{resource_id}' no existe."
-            logging.info(message)
-            return message
-        
-        file_hash = item.get('file_hash')
-        pinecone_ids = response.get('pinecone_ids')
-
-        hash_table.delete_item(Key={'file_hash': file_hash}) 
-        index.delete(ids = pinecone_ids)
-
-        files_table.delete_item(Key={'resource_id': resource_id})
-    except Exception as e:
-        logging.error(f"no se pudo eliminar debido al error: {e}")
-        return f"no se pudo eliminar el registro : {resource_id}"
-
-def upload_to_dynamodb(item, files_table_name, hash_table_name):
-    """Sube un registro a las tablas DynamoDB especificadas."""
-    result = True
-    dynamodb = boto3.resource('dynamodb', region_name="us-east-1")
-    files_table = dynamodb.Table(files_table_name)
-    hash_table = dynamodb.Table(hash_table_name)
-
-    file_hash = item['file_hash']
-
-    # Verifica si el hash ya existe en la tabla hash
-    response = hash_table.get_item(Key={'file_hash': file_hash})
-    if 'Item' not in response:
-        # Registra en la tabla hash
-        hash_table.put_item(Item={'file_hash': file_hash, 's3_path': item['s3_path']})
-        # Registra en la tabla principal
-        files_table.put_item(Item=item)
-    else:
-        result = False
-        logging.info(f"El hash {file_hash} ya existe en la tabla DynamoDB hash.")
-        
-    return result
-
-def process_resource_pdf(metadata, file_path):
+# Funciones para los tipos de archivo
+def process_file_pdf(metadata, file_path):
     """Procesa un archivo PDF."""
     loader = PyPDFLoader(file_path=file_path)
     data = loader.load()
@@ -138,7 +129,7 @@ def process_resource_pdf(metadata, file_path):
     docs = text_splitter.split_documents(documents=data)
     return add_to_pinecone(metadata, docs)
 
-def process_resource_pptx(metadata, file_path):
+def process_file_pptx(metadata, file_path):
     """Procesa un archivo PPTX."""
     prs = PptxPresentation(file_path)
     all_slides = []
@@ -157,7 +148,7 @@ def process_resource_pptx(metadata, file_path):
     docs = text_splitter.split_documents(documents=documents)
     return add_to_pinecone(metadata, docs)
 
-def process_resource_docx(metadata, file_path):
+def process_file_docx(metadata, file_path):
     """Procesa un archivo DOCX."""
     doc = DocxDocument(file_path)
     all_page = [para.text for para in doc.paragraphs]
@@ -170,21 +161,7 @@ def process_resource_docx(metadata, file_path):
     docs = text_splitter.split_documents(documents=documents)
     return add_to_pinecone(metadata, docs)
 
-def add_to_pinecone(metadata, docs):
-    """Agrega documentos a Pinecone y devuelve los IDs generados."""
-    embeddings = BedrockEmbeddings(model_id=EMBEDDINGS_MODEL_ID, credentials_profile_name="prd-sofia-admin", region_name="us-west-2")
-    vector_store = PineconeVectorStore(index=index, embedding=embeddings)
-    uuids = [str(uuid4()) for _ in range(len(docs))] 
-    updated_docs = []
-    for doc, uuid in zip(docs, uuids):
-        doc.metadata.update(metadata)
-        updated_docs.append(doc)
-
-    vector_store.add_documents(documents=updated_docs, ids=uuids)
-    logging.info("Documentos agregados a Pinecone.")
-    return uuids
- 
-def process_resource_xlsx(metadata, file_path):
+def process_file_xlsx(metadata, file_path):
     """Procesa un archivo XLSX dividiendo el contenido estrictamente para cumplir con el límite de tokens."""
     try:
         workbook = load_workbook(file_path)
@@ -216,8 +193,27 @@ def process_resource_xlsx(metadata, file_path):
     except Exception as e:
         logging.error(f"Error procesando archivo XLSX: {e}")
         return []
- 
-def process_event(event):
+
+def add_to_pinecone(metadata, docs):
+    """Agrega documentos a Pinecone y devuelve los IDs generados."""
+    embeddings = BedrockEmbeddings(
+        model_id=EMBEDDINGS_MODEL_ID,
+        credentials_profile_name="prd-sofia-admin",
+        region_name="us-west-2"
+    )
+    vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+    uuids = [str(uuid4()) for _ in range(len(docs))] 
+    updated_docs = []
+    for doc, uuid in zip(docs, uuids):
+        doc.metadata.update(metadata)
+        updated_docs.append(doc)
+
+    vector_store.add_documents(documents=updated_docs, ids=uuids)
+    logging.info("Documentos agregados a Pinecone.")
+    return uuids
+
+# Añadir archivo
+def add_file(event):
     """Procesa el evento para descargar, subir a S3 y registrar en DynamoDB."""
     try:
         logging.info("Procesando evento.")
@@ -234,49 +230,39 @@ def process_event(event):
         s3_path = upload_to_s3(file_path, bucket_name, file_name)
 
         # Construye el objeto para DynamoDB
-        dynamodb_item = {
-            #'syllabus_event_id': event['SilaboEventoId'],
-            #'syllabus_title': event['TituloSilabo'],
-            #'learning_unit_id': event['UnidadAprendizajeId'],
-            #'unit_title': event['TituloUnidad'],
-            #'learning_session_id': event['SesionAprendizajeId'],
-            #'session_title': event['TituloSesion'],
-            #'resource_reference_id': event['RecursoReferenciaId'],
+        dynamodb_resource_obj = {
             'resource_id': event['RecursoDidacticoId'],
             'resource_title': event['TituloRecurso'],
-            'drive_id': event['DriveId'],
+            'drive_id': gdrive_id,
             'file_hash': file_hash,
             's3_path': s3_path,
-            'pinecone_ids': []  # Lista para almacenar los IDs de Pinecone
+            #'pinecone_ids': []  # Lista para almacenar los IDs de Pinecone
         }
-        ####
-        print(dynamodb_item)
-        # Sube los datos a DynamoDB
-        result = upload_to_dynamodb(dynamodb_item, files_table_name, hash_table_name)
+        
+        print(dynamodb_resource_obj)
+        # Sube los datos a DynamoDB (si ya existe el file_hash, ya no lo sube a Pinecone porque ya fue subido anteriormente)
+        result = dynamodb_resources.upload_in_resources(dynamodb_resource_obj)
         if result:
             logging.info("Procesando el archivo para indexación en Pinecone.")
             pinecone_ids = []
 
             if file_name.lower().endswith('pdf'):
-                pinecone_ids = process_resource_pdf(dynamodb_item, file_path)
+                pinecone_ids = process_file_pdf(dynamodb_resource_obj, file_path)
             elif file_name.lower().endswith('pptx'):
-                pinecone_ids = process_resource_pptx(dynamodb_item, file_path)
+                pinecone_ids = process_file_pptx(dynamodb_resource_obj, file_path)
             elif file_name.lower().endswith('docx'):
-                pinecone_ids = process_resource_docx(dynamodb_item, file_path)
+                pinecone_ids = process_file_docx(dynamodb_resource_obj, file_path)
             elif file_name.lower().endswith('xlsx'):
-                pinecone_ids = process_resource_xlsx(dynamodb_item, file_path)
+                pinecone_ids = process_file_xlsx(dynamodb_resource_obj, file_path)
             else: 
                 logging.warning(f"Formato de archivo no compatible: {file_name}")
 
             # Actualiza los IDs de Pinecone en DynamoDB
-            dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-            files_table = dynamodb.Table(files_table_name)
-
-            files_table.update_item(
-                Key={'resource_id': event['RecursoDidacticoId']},
-                UpdateExpression="SET pinecone_ids = :ids",
-                ExpressionAttributeValues={':ids': pinecone_ids}
-            )
+            success = dynamodb_resources.update_in_resources_to_pinecone_ids(event['RecursoDidacticoId'], pinecone_ids)
+            if success:
+                print("Pinecone IDs actualizados correctamente.")
+            else:
+                print("Error al actualizar los Pinecone IDs.")
 
             logging.info("Evento procesado exitosamente.")
 
@@ -286,3 +272,17 @@ def process_event(event):
 
     except Exception as e:
         logging.error(f"Error procesando el evento: {e}")
+
+def delete_file(event):
+    resource_id = event['RecursoDidacticoId']
+    file_name = sanitize_filename(event['TituloRecurso'])
+    silabus_id = event['SilaboEventoId']
+    
+    # Eliminar de DynamoDB (resources y resources_hash) y Pinecone
+    dynamodb_resources.delete_resource_and_vectors(resource_id, index)
+
+    # Eliminar del listado de resources en el silabus
+    dynamodb_library.remove_resource_from_library(silabus_id, resource_id)
+
+    # Eliminar de S3
+    delete_from_s3(bucket_name, file_name)

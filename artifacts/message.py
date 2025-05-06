@@ -17,8 +17,14 @@ class USER_DATA(BaseModel):
     user_id : str
     syllabus_event_id : str
 
-class RESOURCE(BaseModel):
-    RecursoDidacticoId : str
+class SILABO_DATA(BaseModel): 
+    syllabus_event_id : str
+
+class RESOURCE_DATA(BaseModel):
+    RecursoDidacticoId : Optional[str] = None,
+    TituloRecurso : Optional[str] = None,
+    DriveId : Optional[str] = None
+    SilaboEventoId : Optional[str] = None
 
 class SILABO(BaseModel):
     SilaboEventoId : Optional[str] = None

@@ -113,15 +113,15 @@ class DYNAMODB_LIBRARY():
             )
         self.table = self.dynamodb_resource.Table(DYNAMO_LIBRARY_TABLE)
 
-    def save_to_dynamodb(self, rows):
+    def save_to_library_dynamodb(self, rows):
         """Guarda los datos en DynamoDB."""
         grouped_data = {}
         for row in rows:
-            silabus_id, resource_reference_id, resource_id = row
+            silabus_id, resource_id = row
             if silabus_id not in grouped_data:
                 grouped_data[silabus_id] = []
             grouped_data[silabus_id].append({
-                "resource_reference_id": resource_reference_id,
+                #"resource_reference_id": resource_reference_id,
                 "resource_id": resource_id
             })
 
@@ -133,7 +133,130 @@ class DYNAMODB_LIBRARY():
                 }
             ) 
  
-    def search_in_dynamodb(self, silabus_id):
+    def search_in_library_dynamodb(self, silabus_id):
         """Busca en DynamoDB por silabus_id."""
         response = self.table.get_item(Key={"silabus_id": silabus_id})
         return response.get("Item", None)
+
+    def remove_resource_from_library(self, silabus_id, resource_id):
+        """
+        Elimina un resource_id del listado 'resources' en la tabla de library de un silabus_id específico.
+        """
+        try:
+            # Obtener el item del silabus
+            silabus_item = self.table.get_item(Key={'silabus_id': str(silabus_id)})
+            
+            if 'Item' in silabus_item:
+                resources = silabus_item['Item'].get('resources', [])
+                # Filtrar los recursos eliminando el que coincide con resource_id
+                updated_resources = [r for r in resources if r['resource_id'] != resource_id]
+                
+                # Actualizar la entrada en DynamoDB
+                self.table.update_item(
+                    Key={'silabus_id': str(silabus_id)},
+                    UpdateExpression="SET resources = :res",
+                    ExpressionAttributeValues={':res': updated_resources}
+                )
+                logging.info(f"Recurso '{resource_id}' eliminado del silabus '{silabus_id}'.")
+                return True
+            else:
+                logging.warning(f"No se encontró el silabus_id '{silabus_id}'.")
+                return False
+
+        except Exception as e:
+            logging.error(f"Error al eliminar el recurso del silabus: {e}")
+            return False
+    
+class DYNAMODB_RESOURCES():
+    def __init__(self, AWS_ACCESS_KEY_ID = None, AWS_SECRET_ACCESS_KEY = None): 
+        DYNAMO_RESOURCES_TABLE = os.getenv("DYNAMO_RESOURCES_TABLE")
+        DYNAMO_RESOURCES_HASH_TABLE = os.getenv("DYNAMO_RESOURCES_HASH_TABLE")
+        if AWS_ACCESS_KEY_ID is None and AWS_SECRET_ACCESS_KEY is None:            
+            self.dynamodb_resource = boto3.resource('dynamodb')
+        else:
+            self.dynamodb_resource = boto3.resource(
+                'dynamodb',
+                region_name='us-east-1',
+                aws_access_key_id = AWS_ACCESS_KEY_ID,
+                aws_secret_access_key = AWS_SECRET_ACCESS_KEY
+            )
+        self.table_resources = self.dynamodb_resource.Table(DYNAMO_RESOURCES_TABLE)
+        self.table_resources_hash = self.dynamodb_resource.Table(DYNAMO_RESOURCES_HASH_TABLE)
+
+    def upload_in_resources(self, item):
+        """Sube un registro a las tablas DynamoDB especificadas."""
+        result = True
+        file_hash = item['file_hash']
+
+        # Verifica si el hash ya existe en la tabla hash
+        response = self.table_resources_hash.get_item(Key={'file_hash': file_hash})
+        if 'Item' not in response:
+            # Registra en la tabla hash
+            self.table_resources_hash.put_item(Item={'file_hash': file_hash, 's3_path': item['s3_path']})
+            # Registra en la tabla principal
+            self.table_resources.put_item(Item=item)
+        else:
+            result = False
+            logging.info(f"El hash {file_hash} ya existe en la tabla DynamoDB hash.")
+            
+        return result
+    
+    def get_current_pinecone_ids(self, resource_id):
+        """Recupera los IDs de Pinecone actuales asociados al resource_id en DynamoDB."""
+        try:
+            response = self.table_resources.get_item(
+                Key={'resource_id': resource_id}
+            )
+            if 'Item' in response:
+                return response['Item'].get('pinecone_ids', [])
+            else:
+                return []
+        except Exception as e:
+            logging.error(f"Error al obtener Pinecone IDs desde DynamoDB para {resource_id}: {e}")
+            return []
+
+    def update_in_resources_to_pinecone_ids(self, resource_id, pinecone_ids):
+        """Actualiza los IDs de Pinecone en el registro correspondiente de DynamoDB."""
+        try:
+            self.table_resources.update_item(
+                Key={'resource_id': resource_id},
+                UpdateExpression="SET pinecone_ids = :ids",
+                ExpressionAttributeValues={':ids': pinecone_ids}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error al actualizar Pinecone IDs en DynamoDB: {e}")
+            return False
+        
+    def delete_resource_and_vectors(self, resource_id, index):
+        """
+        Elimina un recurso de DynamoDB y sus vectores de Pinecone.
+        """
+        try:
+            # Obtener el elemento
+            response = self.table_resources.get_item(Key={'resource_id': resource_id})   
+            if 'Item' not in response:
+                message = f"El recurso con resource_id '{resource_id}' no existe."
+                logging.info(message)
+                return message
+
+            logging.info(f"Se encontraron los registros")
+            item = response['Item'] 
+            file_hash = item.get('file_hash')
+            pinecone_ids = item.get('pinecone_ids', [])
+
+            # Eliminar de tabla de hash
+            self.table_resources_hash.delete_item(Key={'file_hash': file_hash})
+
+            # Eliminar vectores de Pinecone
+            if pinecone_ids:
+                index.delete(ids=pinecone_ids)
+
+            # Eliminar de tabla principal
+            self.table_resources.delete_item(Key={'resource_id': resource_id})
+
+            return f"Recurso '{resource_id}' eliminado correctamente."
+
+        except Exception as e:
+            logging.error(f"No se pudo eliminar debido al error: {e}")
+            return f"No se pudo eliminar el registro: {resource_id}"
